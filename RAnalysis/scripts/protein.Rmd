@@ -1,0 +1,412 @@
+---
+title: "Protein analysis"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Load Libraries
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+## install packages if you dont already have them
+if (!require("tidyverse")) install.packages("tidyverse")
+if (!require("broom")) install.packages("broom")
+
+# load packages
+library(tidyverse)
+library(broom)
+library(ggplot2)
+
+```
+
+# Import data
+```{r}
+# Helper: read wide-format Gen5 plate reader CSV and return tidy well × absorbance data
+read_prot_plate <- function(filepath) {
+  raw <- read_csv(filepath, skip = 25, col_names = FALSE, show_col_types = FALSE)
+  col_nums <- unlist(raw[1, 3:14])           # plate column numbers 1–12 from header row
+  raw %>%
+    slice(-1) %>%                            # drop header row
+    select(2:14) %>%                         # row letter + 12 data columns
+    set_names(c("row", col_nums)) %>%
+    pivot_longer(-row, names_to = "col_num", values_to = "abs562") %>%
+    mutate(well   = paste0(row, col_num),
+           abs562 = as.numeric(abs562)) %>%
+    select(well, `562:562` = abs562)
+}
+
+# List protein data files
+prot_path = "data/protein/"                                              # Path to prot data directory
+all_prot_files <- list.files(path = prot_path, pattern = "*.csv")          # List all files in directory
+prot_platemaps <- list.files(path = prot_path, pattern = "platemap")       # List platemap files
+prot_data_files <- setdiff(all_prot_files, prot_platemaps)                 # List data files
+
+# Read in all files into tibble
+df <- tibble(file = prot_data_files) %>%
+  mutate(plate = str_remove(file, "_prot\\.csv")) %>%          # e.g., "20261021_Plate1_Host"
+  separate(plate, into = c("date", "plate_num", "fraction"),
+           sep = "_", remove = FALSE) %>%
+  mutate(platemap = map(plate, ~read_csv(paste0(prot_path, ., "_prot_platemap.csv")) %>%
+                          mutate(colony_id = str_trim(colony_id))),  # trim whitespace from colony_id
+         # prot_sym_dilution = uL of 1x PBS added to the aliquot before this run
+         # (blank or absent column = undiluted)
+         platemap = map2(platemap, plate, function(pm, plate_name) {
+           if (!"prot_sym_dilution" %in% names(pm)) pm$prot_sym_dilution <- NA_character_
+           dil_raw <- as.character(pm$prot_sym_dilution)
+           dil_num <- suppressWarnings(as.numeric(dil_raw))
+           # Text entered in this column (e.g. a note) is not a dilution; report and treat as undiluted
+           notes <- !is.na(dil_raw) & trimws(dil_raw) != "" & is.na(dil_num)
+           if (any(notes)) {
+             cat("Non-numeric prot_sym_dilution treated as undiluted in", plate_name, ":\n")
+             print(data.frame(well = pm$well[notes], colony_id = pm$colony_id[notes], value = dil_raw[notes]))
+           }
+           pm$prot_sym_dilution <- replace_na(dil_num, 0)
+           pm
+         }),
+         prot_data = map(file, ~read_prot_plate(paste0(prot_path, .))))
+
+
+# Sample IDs used to validate plate map labels
+sample_ids <- read.csv("data/master_sample_info.csv")
+
+# Fail if any sample label still matches no colony_id (excluding standards, blanks, empty wells)
+unmatched_labels <- df %>%
+  select(plate, platemap) %>%
+  unnest(platemap) %>%
+  filter(!is.na(colony_id), colony_id != "BLANK", !grepl("Standard", colony_id),
+         !colony_id %in% sample_ids$colony_id) %>%
+  distinct(plate, colony_id)
+
+if (nrow(unmatched_labels) > 0) {
+  print(unmatched_labels, n = Inf)
+  stop(n_distinct(unmatched_labels$colony_id),
+       " platemap label(s) match no colony_id in data/master_sample_info.csv; fix the platemap or sample info.")
+}
+
+# Merge platemap and data for each plate
+df <- df %>%
+  mutate(merged = map2(platemap, prot_data, ~ right_join(.x, .y)))
+```
+
+# Plot standard curve
+```{r}
+# Create standard curve following kit instructions
+standards <- tribble(
+  ~std, ~BSA_ug.mL,
+  "A",        2000,
+  "B",        1500,
+  "C",        1000,
+  "D",         750,
+  "E",         500,
+  "F",         250,
+  "G",         125,
+  "H",          25,
+  "I",           0
+)
+
+# Collect all standard wells (Host and Sym plates each have their own standards)
+std_curve <- df %>%
+  unnest(merged) %>%
+  filter(grepl("Standard", colony_id)) %>%
+  select(date, plate, well, colony_id, abs562 = `562:562`) %>%
+  rename(std = colony_id) %>%
+  mutate(std = str_sub(std, 9, 9),
+         # Host and Sym are read as separate plates, each with its own standards
+         fraction = str_extract(plate, "Host|Sym")) %>%
+  #group_by(std) %>%
+  #summarise(abs562 = mean(abs562)) %>%                       # calculate mean of standard duplicates
+  #mutate(abs562.adj = abs562 - abs562[std == "I"]) %>%       # subtract blank absorbace value from all
+  left_join(standards) %>%
+  # Exclude one 750 ug/mL standard that reads ~1.30 (its duplicate reads 0.99, and 1000 ug/mL
+  # standards read ~1.27-1.32), likely a pipetting or labeling error
+  filter(!(plate == "20261026_Plate8_Sym" & well == "A4"))
+
+## Fit one quadratic model per date and fraction using that fraction's standards
+# (object keeps the name lm_models; BCA standards are curved, and a linear fit
+# predicted negative concentrations at low absorbance. Host and Sym standards can
+# differ a lot within a date, e.g. 20261022, so they are not pooled.)
+lm_models <- std_curve %>%
+  group_by(date, fraction) %>%
+  nest() %>%
+  mutate(
+    mod    = map(data, ~ lm(BSA_ug.mL ~ abs562 + I(abs562^2), data = .x)),
+    fitted = map(mod, broom::augment),
+    label  = map2_chr(mod, data, ~{
+      cf <- coef(.x)
+      r2 <- summary(.x)$r.squared
+      sprintf("BSA = %.1f + %.1f \u00d7 Abs + %.1f \u00d7 Abs\u00b2\nR\u00b2 = %.4f",
+              cf[1], cf[2], cf[3], r2)
+    })
+  )
+
+# Plot standard curve from lm fit
+std_curve_plot <- std_curve %>%
+  ggplot(aes(x = abs562, y = BSA_ug.mL, color = date)) +
+  geom_point(size = 3)
+
+Stnd_lm <- std_curve_plot +
+  geom_line(data = lm_models %>% unnest(fitted),
+            aes(x = abs562, y = .fitted, color = date)) +
+  geom_label(data = lm_models %>%
+               unnest(fitted) %>%
+               group_by(date, fraction, label) %>%
+               slice_max(abs562, n = 1) %>%
+               ungroup(),
+             aes(x = abs562, y = .fitted, label = label, color = date),
+             hjust = 1, vjust = 0, size = 2.5,
+             inherit.aes = FALSE, show.legend = FALSE) +
+  facet_wrap(~fraction) +
+  labs(title = "Standard curve (quadratic fit, per date and fraction)")
+Stnd_lm
+
+```
+
+# Calculate protein concentrations
+```{r}
+# Calculate protein concentration for all samples using the date- and fraction-matched standard curve
+prot <- df %>%
+  unnest(merged) %>%
+  filter(!grepl("Standard", colony_id)) %>%                     # Get just samples (not standards)
+  select(date, plate, fraction, well, colony_id, prot_sym_dilution, abs562 = `562:562`) %>%  # Select only needed columns
+  filter(!is.na(colony_id)) %>%                                 # Filter out empty wells
+  filter(colony_id != "BLANK") %>%                              # Filter out blank wells
+  left_join(lm_models %>% select(date, fraction, mod), by = c("date", "fraction")) %>%  # Join matched model
+  mutate(prot_ug.mL = map2_dbl(abs562, mod,                     # Predict using the matched model
+                                ~predict(.y, newdata = data.frame(abs562 = .x)))) %>%
+  select(-mod)                                                  # Drop model column
+
+std_curve_plot + 
+  geom_point(data = prot, aes(x = abs562, y = prot_ug.mL, color = fraction), pch = "X", cex = 5, alpha = 0.3) +
+  scale_color_manual(values = c("Host" = "coral", "Sym" = "green")) +
+  facet_wrap(~fraction) +
+  labs(title = "All samples projected on standard curve")
+```
+
+# Outlier check
+```{r}
+# Absorbance bounds from the standard curve for each date and fraction.
+# Lower bound: the absorbance where the curve predicts 0 ug/mL, or the lowest standard
+# absorbance if the curve is already positive there. Upper bound: highest standard.
+std_range <- std_curve %>%
+  group_by(date, fraction) %>%
+  summarise(abs_min = min(abs562), abs_hi = max(abs562), .groups = "drop") %>%
+  left_join(lm_models %>% select(date, fraction, mod), by = c("date", "fraction")) %>%
+  mutate(abs_lo = pmap_dbl(list(mod, abs_min, abs_hi), function(m, lo, hi) {
+    pred <- function(a) predict(m, data.frame(abs562 = a))
+    if (pred(lo) >= 0) lo else uniroot(pred, c(lo, hi))$root
+  })) %>%
+  select(date, fraction, abs_lo, abs_hi)
+
+# Wells reading up to this fraction above the top standard's absorbance are kept (slight
+# extrapolation of the curve); e.g. 0.05 allows absorbance up to 5% above the top standard
+abs_hi_tolerance <- 0.05
+
+# Flag: (1) absorbance below the standard curve range (below detection; kept, concentration
+# clamped to 0), (2) absorbance above the top standard plus tolerance (removed),
+# (3) within-plate duplicate CV > 30% (removed)
+prot_outliers <- prot %>%
+  left_join(std_range, by = c("date", "fraction")) %>%
+  group_by(colony_id, plate) %>%
+  mutate(CV = sd(abs562) / mean(abs562) * 100) %>%
+  ungroup() %>%
+  mutate(flag_low  = abs562 < abs_lo,
+         flag_high = abs562 > abs_hi * (1 + abs_hi_tolerance),
+         flag_cv   = CV > 30)
+
+# Print any flagged samples
+prot_outliers %>%
+  filter(flag_low | flag_high | flag_cv) %>%
+  select(date, plate, colony_id, well, abs562, prot_ug.mL, CV, flag_low, flag_high, flag_cv) %>%
+  arrange(colony_id) %>%
+  print(n = Inf)
+
+# Plot absorbance per sample; shape = flagged
+prot_outliers %>%
+  ggplot(aes(x = reorder(colony_id, abs562), y = abs562, color = fraction,
+             shape = flag_low | flag_high | flag_cv)) +
+  geom_point(size = 2) +
+  geom_hline(aes(yintercept = abs_lo), linetype = "dashed", color = "gray50") +
+  geom_hline(aes(yintercept = abs_hi), linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("Host" = "coral", "Sym" = "green"), name = "Fraction") +
+  scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 4),
+                     labels = c("OK", "Flagged"), name = NULL) +
+  labs(x = "Sample", y = "Absorbance (562 nm)", title = "Outlier check") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+# Remove outliers
+```{r}
+# Colony+plate groups flagged for high CV (both replicates removed)
+high_cv_groups <- prot_outliers %>%
+  filter(flag_cv) %>%
+  distinct(colony_id, plate)
+
+# Full list of removed wells with reason
+removed_samples <- prot_outliers %>%
+  filter(flag_high | flag_cv) %>%
+  mutate(reason = case_when(
+    flag_high & flag_cv ~ "above top standard + tolerance; high CV",
+    flag_high           ~ "above top standard + tolerance",
+    flag_cv             ~ "high CV (>30%)"
+  )) %>%
+  select(date, plate, colony_id, well, abs562, prot_ug.mL, CV, reason)
+
+print(removed_samples)
+write_csv(removed_samples, "output/protein_removed_samples.csv")
+
+# Remove wells above the top standard and entire high-CV groups. Wells below the standard
+# curve range are kept: their concentration is clamped to 0 and they are marked
+# below_detection (the curve predicts a negative value there)
+prot <- prot_outliers %>%
+  filter(!flag_high) %>%
+  anti_join(high_cv_groups, by = c("colony_id", "plate")) %>%
+  mutate(below_detection = flag_low,
+         prot_ug.mL      = if_else(flag_low, pmax(prot_ug.mL, 0), prot_ug.mL)) %>%
+  select(-abs_lo, -abs_hi, -CV, -flag_low, -flag_high, -flag_cv)
+```
+
+# Calculate mean of technical duplicates and Normalize to surface area
+```{r}
+
+# Calculate mean of technical replicates within each plate
+prot.mean <- prot %>% 
+  group_by(date, plate, fraction, colony_id, prot_sym_dilution) %>%
+  summarise(prot_ug.mL       = mean(prot_ug.mL, na.rm = TRUE),
+            below_detection  = any(below_detection),
+            .groups = "drop")
+
+
+# Surface area data
+sa <- read.csv("output/surface_area_calculated.csv")
+
+# Tissue homogenate volume data (dilution is recorded per run in the plate maps instead)
+homog_vols <- read.csv("data/homogenate_vols.csv") %>%
+  select(-any_of("prot_sym_dilution"))
+
+# Coral sample metadata
+metadata <- read.csv("data/master_sample_info.csv")
+
+# Join homogenate volumes and surface area with sample metadata
+metadata <- metadata %>%
+  left_join(select(homog_vols, colony_id, homog_vol_ml), by = "colony_id") %>%
+  left_join(select(sa, colony_id, surface.area.cm2), by = "colony_id")
+
+# Dilution protocol: the aliquot was 500 uL; 50 uL (2 x 25 uL) was removed for the first
+# assay, leaving 450 uL. prot_sym_dilution uL of PBS was then added to the remaining volume.
+aliquot_ul       <- 500
+assay_removed_ul <- 50
+remaining_ul     <- aliquot_ul - assay_removed_ul
+
+# Join prot data with metadata
+prot.calc <- left_join(prot.mean, metadata, by="colony_id") %>%
+  mutate(plate_num       = as.integer(str_extract(plate, "(?<=Plate)\\d+")),
+         # uL of PBS added before this run, from the plate map
+         pbs_added_ul    = prot_sym_dilution,
+         dilution_factor = (remaining_ul + pbs_added_ul) / remaining_ul,
+         diluted_repeat  = pbs_added_ul > 0,
+         # Back-calculate concentration of the undiluted homogenate
+         prot_ug.mL      = prot_ug.mL * dilution_factor,
+         prot_ug         = prot_ug.mL * homog_vol_ml,
+         prot_ug.cm2     = prot_ug / surface.area.cm2,
+         prot_mg.cm2     = prot_ug.cm2 / 1000,
+         # Corrected concentration exceeds the top standard (informational; not removed)
+         flag_above_top_std = prot_ug.mL > max(standards$BSA_ug.mL))
+
+prot.calc %>%
+  filter(flag_above_top_std) %>%
+  select(plate, colony_id, fraction, diluted_repeat, dilution_factor, prot_ug.mL) %>%
+  print()
+
+# Dilution is primarily expected for Sym runs
+stopifnot(!any(prot.calc$diluted_repeat & prot.calc$fraction != "Sym"))
+```
+
+# Check for duplicates within and across plates; retain most recent run
+```{r}
+# Within-plate duplicates (same colony_id appearing more than once on the same plate)
+within_plate_dups <- prot.calc %>%
+  group_by(date, plate,fraction, colony_id) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+if (nrow(within_plate_dups) > 0) {
+  warning(nrow(within_plate_dups), " within-plate duplicate(s) found:")
+  print(within_plate_dups %>% select(date, plate, colony_id, prot_ug.mL))
+} else {
+  cat("No within-plate duplicates found.\n")
+}
+
+# Across-plate duplicates (same colony_id run on more than one plate)
+across_plate_dups <- prot.calc %>%
+  group_by(colony_id, fraction) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+if (nrow(across_plate_dups) > 0) {
+  cat(n_distinct(across_plate_dups$colony_id), "colony_id(s) run on multiple plates:\n")
+  print(across_plate_dups %>%
+          select(date, plate, colony_id, prot_ug.mL) %>%
+          arrange(colony_id, date))
+} else {
+  cat("No across-plate duplicates found.\n")
+}
+
+# Keep one run for each colony_id + fraction combination: prefer a run that is not below
+# detection, then the diluted repeat if one exists, otherwise the most recent run
+# (date is YYYYMMDD; plate_num breaks same-day ties)
+prot.calc <- prot.calc %>%
+  arrange(below_detection, desc(diluted_repeat), desc(date), desc(plate_num)) %>%
+  distinct(colony_id, fraction, .keep_all = TRUE)
+
+cat("Retained", nrow(prot.calc), "unique samples after deduplication.\n")
+
+# Write protein data to output file
+prot.calc <- prot.calc %>%
+  select(colony_id, fraction, genus, site, prot_ug, prot_mg.cm2, below_detection) %>%
+  filter(!is.na(genus)) %>%
+  filter(!is.na(prot_mg.cm2))
+
+# Holo = total protein (Host + Sym). Only computed for colonies with both fractions retained,
+# so a missing fraction gives no Holo value rather than a Host- or Sym-only total.
+holo <- prot.calc %>%
+  group_by(colony_id, genus, site) %>%
+  filter(all(c("Host", "Sym") %in% fraction)) %>%
+  summarise(prot_ug         = sum(prot_ug[fraction %in% c("Host", "Sym")]),
+            prot_mg.cm2     = sum(prot_mg.cm2[fraction %in% c("Host", "Sym")]),
+            below_detection = any(below_detection),
+            .groups = "drop") %>%
+  mutate(fraction = "Holo")
+
+prot.calc <- bind_rows(prot.calc, holo) %>%
+  select(colony_id, fraction, genus, site, prot_ug, prot_mg.cm2, below_detection)
+write_csv(prot.calc, "output/protein_calcs.csv")
+
+
+
+
+```
+
+# Plot by genus and site
+```{r}
+dodge <- position_dodge(width = 0.5)
+
+protplot <- prot.calc |>
+  ggplot(aes(x = genus, y = prot_mg.cm2, color = site, group = site)) +
+  geom_point(alpha = 0.3, size = 1,
+             position = position_jitterdodge(jitter.width = 0.05, dodge.width = 0.5)) +
+  stat_summary(fun = mean, geom = "line", position = dodge) +
+  stat_summary(fun = mean, geom = "point", position = dodge) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1, position = dodge) +
+  facet_wrap(~factor(fraction, levels = c("Host", "Sym", "Holo"))) +
+  labs(x = "Genus", y = expression("Protein (mg cm"^-2*")"), color = "Site") +
+  theme_bw()
+
+protplot
+
+ggsave("output/protein_by_genus_site.pdf", plot = protplot, width = 10, height = 5)
+
+```
+
+
