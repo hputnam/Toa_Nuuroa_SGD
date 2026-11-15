@@ -1,1 +1,5 @@
-﻿colony_id,Count1,Count2,Count3,Count4,imagefilename1,imagefilename2,imagefilename3,imagefilename4,notes
+﻿colony_id,CountNumber,imagefilename1,imagefilename2,imagefilename3,imagefilename4
+G_POC_50,Count1,,,,
+G_POC_50,Count2,,,,
+G_POC_50,Count3,,,,
+G_POC_50,Count4,,,,
