@@ -1,0 +1,2 @@
+"colony_id","n_counts","min_photos","sd_cells_per_ml","cells_per_ml","cv_percent","cv_flag","incomplete","homog_vol_ml","surface.area.cm2","total_cells","cells_per_cm2"
+"G_POC_48",4,1,145688.022843335,1762500,8.26598711167856,FALSE,TRUE,16,17.9482213021774,28200000,1571186.33235143

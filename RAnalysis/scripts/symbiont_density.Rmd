@@ -1,0 +1,151 @@
+---
+title: "Symbiont cell density"
+author: "HM Putnam"
+date: "20241203"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+## install packages if you dont already have them
+if (!require("tidyverse")) install.packages("tidyverse")
+
+# load packages
+library(tidyverse)
+```
+
+#load data and sample info
+```{r}
+#load wax data
+wax.data <- read.csv("data/surface_area_data.csv", header=TRUE)
+
+# Sample IDs used to validate plate map labels
+sample_ids <- read.csv("data/master_sample_info.csv")
+
+# Surface area data
+sa <- read.csv("output/surface_area_calculated.csv")
+
+# Tissue homogenate volume data 
+homog_vols <- read.csv("data/homogenate_vols.csv") 
+
+```
+
+1ml of sample was taken from the homogenate
+Neubauer improved hemocytometer chamber with an area of 1 mm² and depth of 0.1 mm:
+Cells per mL
+
+Each photo covers one 1 mm² square x 0.1 mm depth = 10^-4 mL. Each replicate count (Count1-4) consists of up to 4 photos (photo1-4), which are summed within the count:
+
+cells/mL for a count = (sum of cells across photos / (number of photos X 10^-4 mL)) X Dilution factor
+
+cells/mL for a colony = mean of the cells/mL values across the replicate counts
+
+CV (%) = SD / mean of the replicate-count cells/mL values X 100
+
+total cells = cells/mL X homogenate volume in mL
+
+cells normalized to surface area = total cells/cm2
+
+# Check for duplicate colony_id
+```{r}
+# Raw hemocytometer counts: one row per replicate count (Count1-4), photo1-4 columns
+sym.counts <- read.csv("data/sym_counts_data.csv")
+
+# Each colony_id + CountNumber should appear once
+dup_counts <- sym.counts |>
+  count(colony_id, CountNumber) |>
+  filter(n > 1)
+
+if (nrow(dup_counts) > 0) {
+  print(dup_counts)
+  stop("Duplicate colony_id + CountNumber rows in sym_counts_data.csv")
+} else {
+  cat("No duplicate colony_id + CountNumber rows in counts.\n")
+}
+
+# Each colony should have 4 replicate counts
+sym.counts |>
+  count(colony_id) |>
+  filter(n != 4) |>
+  print()
+
+# Duplicate colony_id in the lookup tables would multiply rows when joining
+stopifnot(!anyDuplicated(homog_vols$colony_id), !anyDuplicated(sa$colony_id))
+```
+
+```{r}
+photo_vol_ml <- 1e-4  # volume counted in each photo (1 mm2 x 0.1 mm)
+dilution_factor <- 1  # set to the actual dilution used (not recorded in the data file)
+cv_threshold <- 15    # flag colonies with CV (%) above this
+
+# Sum photos within each replicate count and convert to cells/mL
+sym.count.totals <- sym.counts |>
+  rowwise() |>
+  mutate(
+    n_photos = sum(!is.na(c_across(matches("^photo[1-4]$")))),
+    count_total = sum(c_across(matches("^photo[1-4]$")), na.rm = TRUE),
+    cells_per_ml = count_total / (n_photos * photo_vol_ml) * dilution_factor
+  ) |>
+  ungroup() |>
+  select(colony_id, CountNumber, n_photos, count_total, cells_per_ml)
+
+# Mean, SD and CV of cells/mL across the replicate counts for each colony
+sym.density <- sym.count.totals |>
+  group_by(colony_id) |>
+  summarise(
+    n_counts = n(),
+    min_photos = min(n_photos),
+    sd_cells_per_ml = sd(cells_per_ml),
+    cells_per_ml = mean(cells_per_ml),
+    cv_percent = sd_cells_per_ml / cells_per_ml * 100,
+    .groups = "drop"
+  ) |>
+  mutate(
+    cv_flag = cv_percent > cv_threshold,
+    incomplete = n_counts != 4 | min_photos != 4
+  )
+
+sym.density
+```
+
+```{r}
+# Total cells per colony and normalization to surface area
+sym.norm <- sym.density |>
+  left_join(homog_vols, by = "colony_id") |>
+  left_join(select(sa, colony_id, surface.area.cm2), by = "colony_id") |>
+  mutate(
+    total_cells = cells_per_ml * homog_vol_ml,
+    cells_per_cm2 = total_cells / surface.area.cm2
+  )
+
+# Every colony should have a homogenate volume and surface area
+stopifnot(!anyNA(sym.norm$homog_vol_ml), !anyNA(sym.norm$surface.area.cm2))
+stopifnot(!anyDuplicated(sym.norm$colony_id))
+
+write.csv(sym.norm, "output/symbiont_density.csv", row.names = FALSE)
+
+sym.norm
+```
+
+# Plot by genus and site
+```{r}
+sym.plot.data <- sym.norm |>
+  left_join(select(sample_ids, colony_id, genus, site), by = "colony_id") |>
+  filter(!is.na(genus))
+
+dodge <- position_dodge(width = 0.5)
+
+ggplot(sym.plot.data, aes(x = genus, y = cells_per_cm2 / 1e6, color = site, group = site)) +
+  geom_point(alpha = 0.3, size = 1,
+             position = position_jitterdodge(jitter.width = 0.05, dodge.width = 0.5)) +
+  stat_summary(fun = mean, geom = "line", position = dodge) +
+  stat_summary(fun = mean, geom = "point", position = dodge) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1, position = dodge) +
+  labs(x = "Genus", y = expression("Symbiont cells (10"^6*" cm"^-2*")"), color = "Site") +
+  theme_bw()
+
+ggsave("output/symbiont_density_by_genus_site.pdf", width = 8, height = 5)
+```

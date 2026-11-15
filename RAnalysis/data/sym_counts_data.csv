@@ -1,5 +1,5 @@
-﻿colony_id,CountNumber,imagefilename1,imagefilename2,imagefilename3,imagefilename4
-G_POC_50,Count1,,,,
-G_POC_50,Count2,,,,
-G_POC_50,Count3,,,,
-G_POC_50,Count4,,,,
+﻿colony_id,ReplicateNumber,photo1,photo2,photo3,photo4,imagefilename1,imagefilename2,imagefilename3,imagefilename4
+G_POC_48,Rep1,160,NA,NA,NA,G_POC_48_Count1_1,G_POC_48_Count1_2,G_POC_48_Count1_3,G_POC_48_Count1_4
+G_POC_48,Rep2,172,NA,NA,NA,G_POC_48_Count2_1,G_POC_48_Count2_2,G_POC_48_Count2_3,G_POC_48_Count2_4
+G_POC_48,Rep3,195,NA,NA,NA,G_POC_48_Count3_1,G_POC_48_Count3_2,G_POC_48_Count3_3,G_POC_48_Count3_4
+G_POC_48,Rep4,178,NA,NA,NA,G_POC_48_Count4_1,G_POC_48_Count4_2,G_POC_48_Count4_3,G_POC_48_Count4_4
