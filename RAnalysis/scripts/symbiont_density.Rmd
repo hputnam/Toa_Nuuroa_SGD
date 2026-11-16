@@ -54,16 +54,16 @@ cells normalized to surface area = total cells/cm2
 # Raw hemocytometer counts: one row per replicate count (Count1-4), photo1-4 columns
 sym.counts <- read.csv("data/sym_counts_data.csv")
 
-# Each colony_id + CountNumber should appear once
+# Each colony_id + ReplicateNumber should appear once
 dup_counts <- sym.counts |>
-  count(colony_id, CountNumber) |>
+  count(colony_id, ReplicateNumber) |>
   filter(n > 1)
 
 if (nrow(dup_counts) > 0) {
   print(dup_counts)
-  stop("Duplicate colony_id + CountNumber rows in sym_counts_data.csv")
+  stop("Duplicate colony_id + ReplicateNumber rows in sym_counts_data.csv")
 } else {
-  cat("No duplicate colony_id + CountNumber rows in counts.\n")
+  cat("No duplicate colony_id + ReplicateNumber rows in counts.\n")
 }
 
 # Each colony should have 4 replicate counts
@@ -90,7 +90,7 @@ sym.count.totals <- sym.counts |>
     cells_per_ml = count_total / (n_photos * photo_vol_ml) * dilution_factor
   ) |>
   ungroup() |>
-  select(colony_id, CountNumber, n_photos, count_total, cells_per_ml)
+  select(colony_id, ReplicateNumber, n_photos, count_total, cells_per_ml)
 
 # Mean, SD and CV of cells/mL across the replicate counts for each colony
 sym.density <- sym.count.totals |>
